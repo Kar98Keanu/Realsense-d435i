@@ -1,3 +1,14 @@
+"""
+Intel D435i — Depth Colour Map, Colour and Grayscale
+================================================================
+
+Run:
+    python Depthcolourmap.py
+
+Controls:
+    q  — quit
+"""
+
 import pyrealsense2 as rs
 import numpy as np
 import cv2

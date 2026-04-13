@@ -1,11 +1,9 @@
 """
 Intel D435i — Object Detection with Distance & Angle Estimation
 ================================================================
-Dependencies:
-    pip install pyrealsense2 numpy opencv-python ultralytics
 
 Run:
-    python realsense_detect.py
+    python Realsense.py
 
 Controls:
     q  — quit

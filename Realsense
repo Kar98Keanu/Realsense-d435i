@@ -1,0 +1,240 @@
+"""
+Intel D435i — Object Detection with Distance & Angle Estimation
+================================================================
+Dependencies:
+    pip install pyrealsense2 numpy opencv-python ultralytics
+
+Run:
+    python realsense_detect.py
+
+Controls:
+    q  — quit
+    d  — toggle depth colormap overlay
+    c  — cycle YOLO confidence threshold  (0.3 → 0.5 → 0.7)
+"""
+
+import math
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+from ultralytics import YOLO
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+STREAM_W, STREAM_H = 640, 480
+FPS               = 30
+YOLO_MODEL        = "yolov8n.pt"          # nano — swap for yolov8s/m/l for accuracy
+CONF_LEVELS       = [0.3, 0.5, 0.7]       # cycled with 'c'
+DEPTH_SAMPLE_RADIUS = 4                   # px radius for median depth sampling
+FONT              = cv2.FONT_HERSHEY_SIMPLEX
+
+# Colour palette (BGR) — one per class index, tiled if needed
+PALETTE = [
+    (56, 56, 255), (151, 157, 255), (31, 112, 255), (29, 178, 255),
+    (49, 210, 207), (10, 249, 72),  (23, 204, 146), (134, 219, 61),
+    (52, 147, 26),  (187, 212, 0),  (168, 153, 44), (255, 194, 0),
+    (255, 118, 0),  (171, 31, 0),   (117, 20, 12),  (255, 0, 255),
+]
+
+
+def colour_for(class_id: int):
+    return PALETTE[class_id % len(PALETTE)]
+
+
+# ── Depth helpers ─────────────────────────────────────────────────────────────
+
+def median_depth_m(depth_frame, cx: int, cy: int, r: int = DEPTH_SAMPLE_RADIUS) -> float:
+    """
+    Return the median non-zero depth (in metres) within an r-pixel square
+    centred on (cx, cy).  Returns 0.0 if no valid readings exist.
+    """
+    x0, y0 = max(cx - r, 0), max(cy - r, 0)
+    x1 = min(cx + r + 1, depth_frame.get_width())
+    y1 = min(cy + r + 1, depth_frame.get_height())
+
+    patch = np.asanyarray(depth_frame.get_data())[y0:y1, x0:x1].flatten()
+    valid = patch[patch > 0]
+    if len(valid) == 0:
+        return 0.0
+
+    depth_units = depth_frame.get_units()          # typically 0.001 (mm → m)
+    return float(np.median(valid)) * depth_units
+
+
+def pixel_to_angles(cx: int, cy: int, intrinsics) -> tuple[float, float]:
+    """
+    Convert a pixel location to (horizontal_angle, vertical_angle) in degrees
+    relative to the camera's optical axis (image centre).
+
+      tan(θ_h) = (cx - ppx) / fx
+      tan(θ_v) = (cy - ppy) / fy
+
+    Positive horizontal → object is to the RIGHT of centre.
+    Positive vertical   → object is BELOW centre (y increases downward).
+    """
+    h_angle = math.degrees(math.atan2(cx - intrinsics.ppx, intrinsics.fx))
+    v_angle = math.degrees(math.atan2(cy - intrinsics.ppy, intrinsics.fy))
+    return h_angle, v_angle
+
+
+# ── Annotation helper ─────────────────────────────────────────────────────────
+
+def draw_detection(img, box, label: str, colour):
+    """Draw a bounding box and a filled label badge."""
+    x1, y1, x2, y2 = box
+    cv2.rectangle(img, (x1, y1), (x2, y2), colour, 2)
+
+    (tw, th), baseline = cv2.getTextSize(label, FONT, 0.55, 1)
+    badge_y1 = max(y1 - th - baseline - 6, 0)
+    badge_y2 = max(y1, th + baseline + 6)
+
+    cv2.rectangle(img, (x1, badge_y1), (x1 + tw + 6, badge_y2), colour, cv2.FILLED)
+
+    text_colour = (0, 0, 0) if sum(colour) > 400 else (255, 255, 255)
+    cv2.putText(img, label, (x1 + 3, badge_y2 - baseline - 2),
+                FONT, 0.55, text_colour, 1, cv2.LINE_AA)
+
+
+def draw_crosshair(img):
+    """Draw a small crosshair at the image centre."""
+    h, w = img.shape[:2]
+    cx, cy = w // 2, h // 2
+    cv2.line(img, (cx - 15, cy), (cx + 15, cy), (255, 255, 255), 1)
+    cv2.line(img, (cx, cy - 15), (cx, cy + 15), (255, 255, 255), 1)
+    cv2.circle(img, (cx, cy), 3, (0, 200, 255), -1)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    # --- RealSense pipeline setup -------------------------------------------
+    pipe = rs.pipeline()
+    cfg  = rs.config()
+    cfg.enable_stream(rs.stream.depth, STREAM_W, STREAM_H, rs.format.z16,  FPS)
+    cfg.enable_stream(rs.stream.color, STREAM_W, STREAM_H, rs.format.bgr8, FPS)
+
+    profile = pipe.start(cfg)
+
+    # Retrieve depth scale (m per unit) — used only for display sanity check
+    depth_sensor = profile.get_device().first_depth_sensor()
+    print(f"[INFO] Depth scale: {depth_sensor.get_depth_scale():.4f} m/unit")
+
+    # Align depth to colour so bounding boxes match pixel-for-pixel
+    align = rs.align(rs.stream.color)
+
+    # Grab colour stream intrinsics (needed for angle calculation)
+    color_stream  = profile.get_stream(rs.stream.color)
+    intrinsics    = color_stream.as_video_stream_profile().get_intrinsics()
+    print(f"[INFO] Colour intrinsics — fx={intrinsics.fx:.1f}  fy={intrinsics.fy:.1f}  "
+          f"ppx={intrinsics.ppx:.1f}  ppy={intrinsics.ppy:.1f}")
+
+    # --- YOLO ---------------------------------------------------------------
+    model = YOLO(YOLO_MODEL)
+    print(f"[INFO] Loaded YOLO model: {YOLO_MODEL}")
+
+    conf_idx      = 0                      # index into CONF_LEVELS
+    show_depth        = False
+    depth_window_open = False   # tracks whether the depth window actually exists
+
+    print("\n[READY]  Press  q=quit  |  d=toggle depth  |  c=cycle confidence\n")
+
+    try:
+        while True:
+            # ── Grab & align frames ──────────────────────────────────────────
+            frames         = pipe.wait_for_frames()
+            aligned_frames = align.process(frames)
+
+            depth_frame = aligned_frames.get_depth_frame()
+            color_frame = aligned_frames.get_color_frame()
+
+            if not depth_frame or not color_frame:
+                continue
+
+            color_img  = np.asanyarray(color_frame.get_data())          # BGR
+            depth_img  = np.asanyarray(depth_frame.get_data())          # uint16
+
+            # ── YOLO inference ───────────────────────────────────────────────
+            conf  = CONF_LEVELS[conf_idx]
+            results = model(color_img, conf=conf, verbose=False)[0]
+
+            display = color_img.copy()
+
+            for det in results.boxes:
+                # Raw box in xyxy (float) → integer pixel coords
+                x1, y1, x2, y2 = map(int, det.xyxy[0].tolist())
+                class_id  = int(det.cls[0])
+                conf_score = float(det.conf[0])
+                class_name = model.names[class_id]
+                colour     = colour_for(class_id)
+
+                # Centre of bounding box
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                # ── Distance ─────────────────────────────────────────────────
+                dist_m = median_depth_m(depth_frame, cx, cy)
+
+                # ── Angles ───────────────────────────────────────────────────
+                h_angle, v_angle = pixel_to_angles(cx, cy, intrinsics)
+
+                # ── Build label ───────────────────────────────────────────────
+                if dist_m > 0:
+                    label = (f"{class_name} {conf_score:.0%} | "
+                             f"{dist_m:.2f}m | "
+                             f"H:{h_angle:+.1f}° V:{v_angle:+.1f}°")
+                else:
+                    label = (f"{class_name} {conf_score:.0%} | "
+                             f"dist:N/A | "
+                             f"H:{h_angle:+.1f}° V:{v_angle:+.1f}°")
+
+                draw_detection(display, (x1, y1, x2, y2), label, colour)
+
+                # Draw a small dot at bounding-box centre
+                cv2.circle(display, (cx, cy), 4, colour, -1)
+
+                # Draw a thin line from image centre to object centre
+                img_cx, img_cy = STREAM_W // 2, STREAM_H // 2
+                cv2.line(display, (img_cx, img_cy), (cx, cy),
+                         colour, 1, cv2.LINE_AA)
+
+            # ── HUD ──────────────────────────────────────────────────────────
+            draw_crosshair(display)
+            hud = (f"YOLO conf>={conf:.0%}  |  "
+                   f"objs={len(results.boxes)}  |  "
+                   f"[d]depth={'ON' if show_depth else 'off'}  |  [c]conf  |  [q]quit")
+            cv2.putText(display, hud, (8, STREAM_H - 8),
+                        FONT, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+            # ── Windows ───────────────────────────────────────────────────────
+            cv2.imshow("D435i — Detection", display)
+
+            if show_depth:
+                depth_colormap = cv2.applyColorMap(
+                    cv2.convertScaleAbs(depth_img, alpha=0.03), cv2.COLORMAP_JET)
+                cv2.imshow("D435i — Depth", depth_colormap)
+                depth_window_open = True
+            elif depth_window_open:
+                # Only destroy if it was actually created — avoids the
+                # NULL-window crash that fires on the very first frames
+                # before 'd' has ever been pressed.
+                cv2.destroyWindow("D435i — Depth")
+                depth_window_open = False
+
+            # ── Key handling ──────────────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('d'):
+                show_depth = not show_depth
+            elif key == ord('c'):
+                conf_idx = (conf_idx + 1) % len(CONF_LEVELS)
+                print(f"[INFO] Confidence threshold → {CONF_LEVELS[conf_idx]:.0%}")
+
+    finally:
+        pipe.stop()
+        cv2.destroyAllWindows()
+        print("[INFO] Pipeline stopped.")
+
+
+if __name__ == "__main__":
+    main()
